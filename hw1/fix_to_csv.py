@@ -22,4 +22,102 @@
 # ID1832,20250910-08:00:01.195,20250910-08:00:01.324,NIO,1,1,6.260000,6.030000,ID1517
 # ID1836,20250910-08:00:01.196,20250910-08:00:01.334,NIO,1,1,6.260000,6.030000,ID1517
 
+import argparse, csv
+from decimal import Decimal, InvalidOperation
 
+HEADER = [
+    "OrderID","OrderTransactTime","ExecutionTransactTime",
+    "Symbol","Side","OrderQty","LimitPrice","AvgPx","LastMkt",
+]
+
+def must_endwith(path, ext):
+    if not path.lower().endswith(ext):
+        raise argparse.ArgumentTypeError(f"{path} must end with {ext}")
+    return path
+
+def parse_line(line):
+    """Return dict of FIX tag->value from 'ts : FIX' line. None if malformed."""
+    if " : " not in line:
+        return None
+    _, msg = line.split(" : ", 1)
+    msg = msg.strip().replace("^A", "\x01").rstrip("\x01$")  # support both SOH and literal ^A
+    fields = {}
+    for part in msg.split("\x01"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            fields[k] = v
+    return fields
+
+def fmt6(x):
+    if not x: return ""
+    try:      return f"{Decimal(x):.6f}"
+    except InvalidOperation:
+        return x
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser(prog="fix_to_csv", description="Filled LIMIT orders to CSV")
+    p.add_argument("--input_fix_file",  required=True, type=lambda s: must_endwith(s, ".fix"))
+    p.add_argument("--output_csv_file", required=True, type=lambda s: must_endwith(s, ".csv"))
+    args = p.parse_args()
+
+    # Collect NewOrderSingle LIMIT (35=D & 40=2) by ClOrdID (11)
+    orders = {}  # 11 -> {needed order fields}
+    fills  = []  # list of fills (joined later)
+
+    with open(args.input_fix_file, "r", encoding="utf-8", errors="replace") as f:
+        for raw in f:
+            fields = parse_line(raw.rstrip("\n"))
+            if not fields:
+                continue
+
+            mt = fields.get("35", "")
+
+            # NewOrderSingle LIMIT
+            if mt == "D" and fields.get("40") == "2":
+                oid = fields.get("11", "")
+                if oid:
+                    orders[oid] = {
+                        "OrderID": oid,
+                        "OrderTransactTime": fields.get("60", ""),
+                        "Symbol": fields.get("55", ""),
+                        "Side": fields.get("54", ""),
+                        "OrderQty": fields.get("38", ""),
+                        "LimitPrice": fields.get("44", ""),
+                    }
+
+            # ExecutionReport full fill LIMIT (35=8, 150=2, 39=2, 40=2)
+            elif mt == "8" and fields.get("150") == "2" and fields.get("39") == "2" and fields.get("40") == "2":
+                oid = fields.get("11", "")
+                if oid:
+                    fills.append({
+                        "OrderID": oid,
+                        "ExecutionTransactTime": fields.get("60", ""),
+                        "AvgPx": fields.get("6", ""),
+                        "LastMkt": fields.get("30", ""),
+                    })
+
+    # Join fills to orders on ClOrdID (11) and write CSV
+    out_rows, skipped = [], 0
+    for fx in fills:
+        o = orders.get(fx["OrderID"])
+        if not o:
+            skipped += 1
+            continue
+        out_rows.append({
+            "OrderID": o["OrderID"],
+            "OrderTransactTime": o["OrderTransactTime"],
+            "ExecutionTransactTime": fx["ExecutionTransactTime"],
+            "Symbol": o["Symbol"],
+            "Side": o["Side"],
+            "OrderQty": o["OrderQty"],
+            "LimitPrice": fmt6(o["LimitPrice"]),
+            "AvgPx": fmt6(fx["AvgPx"]),
+            "LastMkt": fx["LastMkt"],
+        })
+
+    with open(args.output_csv_file, "w", newline="", encoding="utf-8") as fo:
+        w = csv.DictWriter(fo, fieldnames=HEADER)
+        w.writeheader(); w.writerows(out_rows)
+
+    print(f"Wrote {len(out_rows)} rows to {args.output_csv_file}" +
+          (f" (skipped {skipped} unmatched fills)" if skipped else ""))
